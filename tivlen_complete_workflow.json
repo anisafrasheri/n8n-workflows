@@ -1,0 +1,934 @@
+{
+  "name": "Tivlen Complete Automation v2",
+  "_meta": {
+    "version": "2.0",
+    "description": "Full Tivlen daily social content pipeline with WhatsApp approval, 3 variants, Story format, analytics loop, voice memory, and monthly report.",
+    "workflows": [
+      "WORKFLOW 1: Sunday Batch (weekly)",
+      "WORKFLOW 2: Daily WhatsApp Approval (daily 9am)",
+      "WORKFLOW 3: WhatsApp Reply Webhook (on demand)",
+      "WORKFLOW 4: Analytics Collector (48h after post)",
+      "WORKFLOW 5: Monthly Report (1st of month)"
+    ],
+    "setup_checklist": [
+      "1. Google Drive: create folder 'tivlen-quotes/', copy folder ID",
+      "2. Google Sheets: create sheet with columns listed in SHEETS_SCHEMA below",
+      "3. Anthropic API: get key from console.anthropic.com",
+      "4. Twilio: sign up, activate WhatsApp sandbox, get Account SID + Auth Token",
+      "5. CloudConvert: sign up, get API key (or use Puppeteer node if self-hosted)",
+      "6. Gmail: connect OAuth2 for monthly report",
+      "7. Instagram Basic Display API: connect Business account",
+      "8. LinkedIn API: connect OAuth2",
+      "9. Set all n8n Variables listed in VARIABLES section",
+      "10. Import all 5 workflows, activate in order 3 → 4 → 5 → 1 → 2"
+    ],
+    "SHEETS_SCHEMA": {
+      "sheet_name": "posts",
+      "columns": "row_id | quote_text | pillar | format | scheduled_date | status | variant_a_svg | variant_b_svg | variant_c_svg | variant_a_ig_caption | variant_b_ig_caption | variant_c_ig_caption | variant_a_li_caption | variant_b_li_caption | variant_c_li_caption | approved_variant | ig_post_id | li_post_id | ig_likes | ig_saves | ig_reach | ig_comments | ig_eng_rate | li_reactions | li_impressions | li_comments | posted_at | drive_file_id"
+    },
+    "VARIABLES": {
+      "GOOGLE_DRIVE_FOLDER_ID": "Your tivlen-quotes/ folder ID",
+      "GOOGLE_SHEETS_ID": "Your tracking spreadsheet ID",
+      "ANTHROPIC_API_KEY": "sk-ant-...",
+      "TWILIO_ACCOUNT_SID": "ACxxxx",
+      "TWILIO_AUTH_TOKEN": "your_token",
+      "TWILIO_WHATSAPP_FROM": "whatsapp:+14155238886",
+      "ANISA_WHATSAPP_NUMBER": "whatsapp:+34XXXXXXXXX",
+      "CLOUDCONVERT_API_KEY": "your_key",
+      "REPORT_EMAIL": "anisa@tivlenshop.com",
+      "N8N_WEBHOOK_BASE_URL": "https://your-n8n-instance.com/webhook"
+    }
+  },
+
+  "workflows": {
+
+    "WORKFLOW_1_SUNDAY_BATCH": {
+      "name": "Tivlen — Sunday Batch Generator",
+      "description": "Runs every Sunday 8am. Picks 7 quote images, calls Claude to generate 3 variants each, stores all in Google Sheets with Mon-Sun schedule.",
+      "nodes": [
+        {
+          "id": "w1_trigger",
+          "name": "Every Sunday 8am",
+          "type": "n8n-nodes-base.scheduleTrigger",
+          "parameters": {
+            "rule": { "interval": [{ "field": "cronExpression", "expression": "0 8 * * 0" }] }
+          },
+          "position": [100, 300]
+        },
+        {
+          "id": "w1_list_drive",
+          "name": "List quote images from Drive",
+          "type": "n8n-nodes-base.googleDrive",
+          "parameters": {
+            "operation": "list",
+            "folderId": "={{$vars.GOOGLE_DRIVE_FOLDER_ID}}",
+            "returnAll": true
+          },
+          "position": [300, 300]
+        },
+        {
+          "id": "w1_read_sheets",
+          "name": "Read used quotes from Sheets",
+          "type": "n8n-nodes-base.googleSheets",
+          "parameters": {
+            "operation": "getAll",
+            "spreadsheetId": "={{$vars.GOOGLE_SHEETS_ID}}",
+            "sheetName": "posts",
+            "returnAll": true
+          },
+          "position": [300, 440]
+        },
+        {
+          "id": "w1_read_top_posts",
+          "name": "Read top performing posts",
+          "type": "n8n-nodes-base.googleSheets",
+          "parameters": {
+            "operation": "getAll",
+            "spreadsheetId": "={{$vars.GOOGLE_SHEETS_ID}}",
+            "sheetName": "posts",
+            "returnAll": false,
+            "limit": 20,
+            "options": {
+              "sort": { "column": "ig_eng_rate", "direction": "desc" }
+            }
+          },
+          "position": [300, 580]
+        },
+        {
+          "id": "w1_pick_7",
+          "name": "Pick 7 unused images + build voice context",
+          "type": "n8n-nodes-base.code",
+          "parameters": {
+            "jsCode": "// Get all Drive files\nconst driveFiles = $('List quote images from Drive').all().map(i => i.json);\nconst allImages = driveFiles.filter(f => f.mimeType && f.mimeType.startsWith('image/'));\n\n// Get already-used file IDs from Sheets\nconst usedRows = $('Read used quotes from Sheets').all().map(i => i.json);\nconst usedIds = new Set(usedRows.map(r => r.drive_file_id).filter(Boolean));\n\n// Filter to unused\nconst unused = allImages.filter(f => !usedIds.has(f.id));\nif (unused.length === 0) throw new Error('No unused quote images left in Drive folder!');\n\n// Pick up to 7 (or fewer if not enough)\nconst pick = unused.slice(0, 7);\n\n// Build voice memory from top posts\nconst topPosts = $('Read top performing posts').all().map(i => i.json);\nconst voiceExamples = topPosts\n  .filter(p => p.approved_variant && p['variant_' + p.approved_variant.toLowerCase() + '_ig_caption'])\n  .slice(0, 5)\n  .map(p => ({\n    caption: p['variant_' + p.approved_variant.toLowerCase() + '_ig_caption'],\n    eng_rate: p.ig_eng_rate,\n    format: p.format,\n    pillar: p.pillar\n  }));\n\n// Calculate next Monday\nconst today = new Date();\nconst dayOfWeek = today.getDay();\nconst daysUntilMonday = dayOfWeek === 0 ? 1 : (8 - dayOfWeek);\nconst monday = new Date(today);\nmonday.setDate(today.getDate() + daysUntilMonday);\n\n// Build schedule dates\nconst scheduleDates = pick.map((file, i) => {\n  const d = new Date(monday);\n  d.setDate(monday.getDate() + i);\n  return d.toISOString().split('T')[0];\n});\n\nreturn pick.map((file, i) => ({\n  json: {\n    fileId: file.id,\n    fileName: file.name,\n    mimeType: file.mimeType,\n    scheduledDate: scheduleDates[i],\n    dayIndex: i,\n    voiceMemory: JSON.stringify(voiceExamples)\n  }\n}));"
+          },
+          "position": [540, 400]
+        },
+        {
+          "id": "w1_download_image",
+          "name": "Download each quote image",
+          "type": "n8n-nodes-base.googleDrive",
+          "parameters": {
+            "operation": "download",
+            "fileId": "={{$json.fileId}}"
+          },
+          "position": [740, 400]
+        },
+        {
+          "id": "w1_to_base64",
+          "name": "Convert image to base64",
+          "type": "n8n-nodes-base.code",
+          "parameters": {
+            "jsCode": "const binaryData = $input.first().binary;\nconst binaryKey = Object.keys(binaryData)[0];\nconst mimeType = binaryData[binaryKey].mimeType || 'image/png';\nconst base64Data = binaryData[binaryKey].data;\n\n// Pass through all metadata from previous node\nconst meta = $('Pick 7 unused images + build voice context').item.json;\n\nreturn [{ json: {\n  base64Image: base64Data,\n  mimeType: mimeType,\n  fileId: meta.fileId,\n  fileName: meta.fileName,\n  scheduledDate: meta.scheduledDate,\n  voiceMemory: meta.voiceMemory\n}}];"
+          },
+          "position": [940, 400]
+        },
+        {
+          "id": "w1_claude_generate",
+          "name": "Claude — generate 3 variants",
+          "type": "n8n-nodes-base.httpRequest",
+          "parameters": {
+            "method": "POST",
+            "url": "https://api.anthropic.com/v1/messages",
+            "sendHeaders": true,
+            "headerParameters": {
+              "parameters": [
+                { "name": "x-api-key", "value": "={{$vars.ANTHROPIC_API_KEY}}" },
+                { "name": "anthropic-version", "value": "2023-06-01" },
+                { "name": "content-type", "value": "application/json" }
+              ]
+            },
+            "sendBody": true,
+            "specifyBody": "json",
+            "jsonBody": "={\n  \"model\": \"claude-sonnet-4-20250514\",\n  \"max_tokens\": 8000,\n  \"system\": \"You are the social media content generator for Tivlen Shop, a purpose-driven brand by Anisa Frasheri that empowers young people to build self-confidence.\\n\\nBRAND COLORS: Background #FFF8E1 (warm cream, NEVER pure white), Primary yellow #F5C518 (must dominate), Dark text #1A1A1A, Dark olive #3D3000.\\nFONTS: Always mix bold sans-serif (Arial Black) + cursive (Dancing Script). Never one font only.\\nWATERMARK: Cursive 'tivlen shop' bottom center on every post.\\nDECORATION: Always include 2-3 of: yellow pill containers (rx=30 fill=#F5C518), large quotation marks, sparkle stars, wavy lines, white cards on cream.\\n\\nPOST FORMATS LIBRARY:\\n- Quote Graphic: large quote in yellow pill, cursive accent, decorative marks\\n- Affirmation Card: white card on cream, REMINDER: opener, yellow accents\\n- Motivational Typography: bold ALL CAPS filling frame, minimal decoration\\n- Myth vs Truth: two cards, dark myth card + yellow truth card\\n- Search Bar Format: mock search showing 'you are...' autocomplete\\n- Brand Awareness: circles listing Tivlen pillars\\n\\nCONTENT PILLARS: Empowerment, Community, Awareness, Growth, Lifestyle, Thought Leadership\\n\\nOUTPUT: Respond ONLY with valid JSON, no markdown, no backticks:\\n{\\n  \\\"quote_extracted\\\": \\\"text from image\\\",\\n  \\\"pillar\\\": \\\"detected pillar\\\",\\n  \\\"variant_a\\\": {\\n    \\\"format\\\": \\\"format name\\\",\\n    \\\"svg_feed\\\": \\\"<svg viewBox='0 0 1080 1080'>...</svg>\\\",\\n    \\\"svg_story\\\": \\\"<svg viewBox='0 0 1080 1920'>...</svg>\\\",\\n    \\\"ig_caption\\\": \\\"instagram caption\\\",\\n    \\\"li_caption\\\": \\\"linkedin caption\\\"\\n  },\\n  \\\"variant_b\\\": { ...same structure... },\\n  \\\"variant_c\\\": { ...same structure... }\\n}\\n\\nINSTAGRAM CAPTION RULES: Scroll-stopper first line. 3-5 short lines. Soft CTA at end (Save this or Share with someone). 10-15 hashtags after 2 blank lines: mix #selfconfidence #mentalhealth #tivlenshop #tivlen #youareenough #believeinyourself. Minimal emoji, 💛 is signature.\\n\\nLINKEDIN CAPTION RULES: Anisa's first-person voice. Open with personal insight from working with youth. 3-5 short paragraphs, 1-2 sentences each, lots of white space. Concrete takeaway. End with open question. 3-5 hashtags: #youthempowerment #selfconfidence #tivlen #purposedriven.\",\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": [\n        {\n          \"type\": \"image\",\n          \"source\": {\n            \"type\": \"base64\",\n            \"media_type\": \"={{ $json.mimeType }}\",\n            \"data\": \"={{ $json.base64Image }}\"\n          }\n        },\n        {\n          \"type\": \"text\",\n          \"text\": \"={{ 'Today is ' + new Date().toLocaleDateString('en-GB', {weekday:'long', day:'numeric', month:'long', year:'numeric'}) + '. Voice memory from top posts: ' + $json.voiceMemory + '. Read the quote from this image. Auto-detect the best content pillar. Generate 3 different visual variants using different formats from the library. Make each variant visually distinct. Return only valid JSON.' }}\"\n        }\n      ]\n    }\n  ]\n}"
+          },
+          "position": [1140, 400]
+        },
+        {
+          "id": "w1_parse_claude",
+          "name": "Parse Claude response",
+          "type": "n8n-nodes-base.code",
+          "parameters": {
+            "jsCode": "const response = $input.first().json;\nconst rawText = response.content[0].text;\n\nlet parsed;\ntry {\n  const cleaned = rawText.replace(/```json|```/g, '').trim();\n  parsed = JSON.parse(cleaned);\n} catch(err) {\n  throw new Error('Claude JSON parse failed. Raw: ' + rawText.substring(0, 300));\n}\n\nconst meta = $('Convert image to base64').item.json;\n\nreturn [{ json: {\n  row_id: 'post_' + Date.now(),\n  quote_text: parsed.quote_extracted,\n  pillar: parsed.pillar,\n  format: parsed.variant_a.format,\n  scheduled_date: meta.scheduledDate,\n  drive_file_id: meta.fileId,\n  status: 'pending_approval',\n  variant_a_svg_feed: parsed.variant_a.svg_feed,\n  variant_a_svg_story: parsed.variant_a.svg_story,\n  variant_a_ig_caption: parsed.variant_a.ig_caption,\n  variant_a_li_caption: parsed.variant_a.li_caption,\n  variant_a_format: parsed.variant_a.format,\n  variant_b_svg_feed: parsed.variant_b.svg_feed,\n  variant_b_svg_story: parsed.variant_b.svg_story,\n  variant_b_ig_caption: parsed.variant_b.ig_caption,\n  variant_b_li_caption: parsed.variant_b.li_caption,\n  variant_b_format: parsed.variant_b.format,\n  variant_c_svg_feed: parsed.variant_c.svg_feed,\n  variant_c_svg_story: parsed.variant_c.svg_story,\n  variant_c_ig_caption: parsed.variant_c.ig_caption,\n  variant_c_li_caption: parsed.variant_c.li_caption,\n  variant_c_format: parsed.variant_c.format\n}}];"
+          },
+          "position": [1340, 400]
+        },
+        {
+          "id": "w1_write_sheets",
+          "name": "Write row to Google Sheets",
+          "type": "n8n-nodes-base.googleSheets",
+          "parameters": {
+            "operation": "append",
+            "spreadsheetId": "={{$vars.GOOGLE_SHEETS_ID}}",
+            "sheetName": "posts",
+            "columns": {
+              "mappingMode": "defineBelow",
+              "value": {
+                "row_id": "={{$json.row_id}}",
+                "quote_text": "={{$json.quote_text}}",
+                "pillar": "={{$json.pillar}}",
+                "format": "={{$json.format}}",
+                "scheduled_date": "={{$json.scheduled_date}}",
+                "drive_file_id": "={{$json.drive_file_id}}",
+                "status": "pending_approval",
+                "variant_a_svg_feed": "={{$json.variant_a_svg_feed}}",
+                "variant_a_svg_story": "={{$json.variant_a_svg_story}}",
+                "variant_a_ig_caption": "={{$json.variant_a_ig_caption}}",
+                "variant_a_li_caption": "={{$json.variant_a_li_caption}}",
+                "variant_a_format": "={{$json.variant_a_format}}",
+                "variant_b_svg_feed": "={{$json.variant_b_svg_feed}}",
+                "variant_b_svg_story": "={{$json.variant_b_svg_story}}",
+                "variant_b_ig_caption": "={{$json.variant_b_ig_caption}}",
+                "variant_b_li_caption": "={{$json.variant_b_li_caption}}",
+                "variant_b_format": "={{$json.variant_b_format}}",
+                "variant_c_svg_feed": "={{$json.variant_c_svg_feed}}",
+                "variant_c_svg_story": "={{$json.variant_c_svg_story}}",
+                "variant_c_ig_caption": "={{$json.variant_c_ig_caption}}",
+                "variant_c_li_caption": "={{$json.variant_c_li_caption}}",
+                "variant_c_format": "={{$json.variant_c_format}}"
+              }
+            }
+          },
+          "position": [1540, 400]
+        },
+        {
+          "id": "w1_whatsapp_sunday",
+          "name": "WhatsApp — confirm batch ready",
+          "type": "n8n-nodes-base.twilio",
+          "parameters": {
+            "operation": "send",
+            "from": "={{$vars.TWILIO_WHATSAPP_FROM}}",
+            "to": "={{$vars.ANISA_WHATSAPP_NUMBER}}",
+            "message": "={{\"✅ *Tivlen batch ready!*\\n\\nGenerated content for this week:\\n\" + $('Pick 7 unused images + build voice context').all().map((item, i) => (i+1) + '. ' + item.json.scheduledDate).join('\\n') + \"\\n\\nYou'll get a WhatsApp at 9am each day to approve before posting. 💛\"}}"
+          },
+          "position": [1740, 400]
+        }
+      ],
+      "connections": {
+        "Every Sunday 8am": { "main": [[{ "node": "List quote images from Drive" }, { "node": "Read used quotes from Sheets" }, { "node": "Read top performing posts" }]] },
+        "List quote images from Drive": { "main": [[{ "node": "Pick 7 unused images + build voice context" }]] },
+        "Read used quotes from Sheets": { "main": [[{ "node": "Pick 7 unused images + build voice context" }]] },
+        "Read top performing posts": { "main": [[{ "node": "Pick 7 unused images + build voice context" }]] },
+        "Pick 7 unused images + build voice context": { "main": [[{ "node": "Download each quote image" }]] },
+        "Download each quote image": { "main": [[{ "node": "Convert image to base64" }]] },
+        "Convert image to base64": { "main": [[{ "node": "Claude — generate 3 variants" }]] },
+        "Claude — generate 3 variants": { "main": [[{ "node": "Parse Claude response" }]] },
+        "Parse Claude response": { "main": [[{ "node": "Write row to Google Sheets" }]] },
+        "Write row to Google Sheets": { "main": [[{ "node": "WhatsApp — confirm batch ready" }]] }
+      }
+    },
+
+    "WORKFLOW_2_DAILY_APPROVAL": {
+      "name": "Tivlen — Daily Morning Approval",
+      "description": "Runs every day at 9am. Reads today's scheduled post from Sheets, sends 3 variant previews to WhatsApp. Auto-posts Variant A at 10am if no reply.",
+      "nodes": [
+        {
+          "id": "w2_trigger",
+          "name": "Every day at 9am",
+          "type": "n8n-nodes-base.scheduleTrigger",
+          "parameters": {
+            "rule": { "interval": [{ "field": "cronExpression", "expression": "0 9 * * *" }] }
+          },
+          "position": [100, 300]
+        },
+        {
+          "id": "w2_get_todays_post",
+          "name": "Get today's post from Sheets",
+          "type": "n8n-nodes-base.googleSheets",
+          "parameters": {
+            "operation": "getAll",
+            "spreadsheetId": "={{$vars.GOOGLE_SHEETS_ID}}",
+            "sheetName": "posts",
+            "returnAll": true,
+            "options": {
+              "filters": {
+                "conditions": [
+                  { "column": "scheduled_date", "value": "={{new Date().toISOString().split('T')[0]}}" },
+                  { "column": "status", "value": "pending_approval" }
+                ]
+              }
+            }
+          },
+          "position": [300, 300]
+        },
+        {
+          "id": "w2_check_post_exists",
+          "name": "Post exists today?",
+          "type": "n8n-nodes-base.if",
+          "parameters": {
+            "conditions": {
+              "number": [{ "value1": "={{$json.length}}", "operation": "larger", "value2": 0 }]
+            }
+          },
+          "position": [500, 300]
+        },
+        {
+          "id": "w2_build_message",
+          "name": "Build WhatsApp preview message",
+          "type": "n8n-nodes-base.code",
+          "parameters": {
+            "jsCode": "const post = $input.first().json;\nconst today = new Date().toLocaleDateString('en-GB', {weekday:'long', day:'numeric', month:'long'});\n\nconst message = [\n  `🌟 *Tivlen — ${today}*`,\n  '',\n  `📌 *Quote:* \"${post.quote_text}\"`,\n  `🏷 Pillar: ${post.pillar}`,\n  '',\n  '3 variants are ready. Reply with:',\n  '*1* → Post Variant A: ' + post.variant_a_format,\n  '*2* → Post Variant B: ' + post.variant_b_format,\n  '*3* → Post Variant C: ' + post.variant_c_format,\n  '*0* → Skip today',\n  '',\n  '⏰ No reply by 10am = auto-posts Variant A',\n  '',\n  '💛 _Captions preview in next messages_'\n].join('\\n');\n\nreturn [{ json: {\n  row_id: post.row_id,\n  message: message,\n  ig_caption_a: 'VARIANT A CAPTION:\\n' + post.variant_a_ig_caption,\n  ig_caption_b: 'VARIANT B CAPTION:\\n' + post.variant_b_ig_caption,\n  ig_caption_c: 'VARIANT C CAPTION:\\n' + post.variant_c_ig_caption\n}}];"
+          },
+          "position": [700, 220]
+        },
+        {
+          "id": "w2_wa_main",
+          "name": "WhatsApp — send main approval",
+          "type": "n8n-nodes-base.twilio",
+          "parameters": {
+            "operation": "send",
+            "from": "={{$vars.TWILIO_WHATSAPP_FROM}}",
+            "to": "={{$vars.ANISA_WHATSAPP_NUMBER}}",
+            "message": "={{$json.message}}"
+          },
+          "position": [900, 220]
+        },
+        {
+          "id": "w2_wa_caption_a",
+          "name": "WhatsApp — caption A preview",
+          "type": "n8n-nodes-base.twilio",
+          "parameters": {
+            "operation": "send",
+            "from": "={{$vars.TWILIO_WHATSAPP_FROM}}",
+            "to": "={{$vars.ANISA_WHATSAPP_NUMBER}}",
+            "message": "={{$('Build WhatsApp preview message').item.json.ig_caption_a}}"
+          },
+          "position": [1100, 140]
+        },
+        {
+          "id": "w2_wa_caption_b",
+          "name": "WhatsApp — caption B preview",
+          "type": "n8n-nodes-base.twilio",
+          "parameters": {
+            "operation": "send",
+            "from": "={{$vars.TWILIO_WHATSAPP_FROM}}",
+            "to": "={{$vars.ANISA_WHATSAPP_NUMBER}}",
+            "message": "={{$('Build WhatsApp preview message').item.json.ig_caption_b}}"
+          },
+          "position": [1100, 260]
+        },
+        {
+          "id": "w2_wa_caption_c",
+          "name": "WhatsApp — caption C preview",
+          "type": "n8n-nodes-base.twilio",
+          "parameters": {
+            "operation": "send",
+            "from": "={{$vars.TWILIO_WHATSAPP_FROM}}",
+            "to": "={{$vars.ANISA_WHATSAPP_NUMBER}}",
+            "message": "={{$('Build WhatsApp preview message').item.json.ig_caption_c}}"
+          },
+          "position": [1100, 380]
+        },
+        {
+          "id": "w2_autopost_trigger",
+          "name": "Every day at 10am (auto-post fallback)",
+          "type": "n8n-nodes-base.scheduleTrigger",
+          "parameters": {
+            "rule": { "interval": [{ "field": "cronExpression", "expression": "0 10 * * *" }] }
+          },
+          "position": [100, 500]
+        },
+        {
+          "id": "w2_check_still_pending",
+          "name": "Still pending approval?",
+          "type": "n8n-nodes-base.googleSheets",
+          "parameters": {
+            "operation": "getAll",
+            "spreadsheetId": "={{$vars.GOOGLE_SHEETS_ID}}",
+            "sheetName": "posts",
+            "returnAll": true,
+            "options": {
+              "filters": {
+                "conditions": [
+                  { "column": "scheduled_date", "value": "={{new Date().toISOString().split('T')[0]}}" },
+                  { "column": "status", "value": "pending_approval" }
+                ]
+              }
+            }
+          },
+          "position": [300, 500]
+        },
+        {
+          "id": "w2_autopost_if_pending",
+          "name": "Auto-approve Variant A",
+          "type": "n8n-nodes-base.code",
+          "parameters": {
+            "jsCode": "const rows = $input.all();\nif (rows.length === 0) return []; // already approved, skip\n\nconst post = rows[0].json;\n\n// Trigger the posting flow by calling Workflow 3 internally via HTTP\n// (or duplicate the render+post logic here)\nreturn [{ json: {\n  row_id: post.row_id,\n  approved_variant: 'a',\n  auto_approved: true,\n  svg_feed: post.variant_a_svg_feed,\n  svg_story: post.variant_a_svg_story,\n  ig_caption: post.variant_a_ig_caption,\n  li_caption: post.variant_a_li_caption\n}}];"
+          },
+          "position": [500, 500]
+        }
+      ],
+      "connections": {
+        "Every day at 9am": { "main": [[{ "node": "Get today's post from Sheets" }]] },
+        "Get today's post from Sheets": { "main": [[{ "node": "Post exists today?" }]] },
+        "Post exists today?": {
+          "main": [
+            [{ "node": "Build WhatsApp preview message" }],
+            []
+          ]
+        },
+        "Build WhatsApp preview message": { "main": [[{ "node": "WhatsApp — send main approval" }]] },
+        "WhatsApp — send main approval": { "main": [[{ "node": "WhatsApp — caption A preview" }, { "node": "WhatsApp — caption B preview" }, { "node": "WhatsApp — caption C preview" }]] },
+        "Every day at 10am (auto-post fallback)": { "main": [[{ "node": "Still pending approval?" }]] },
+        "Still pending approval?": { "main": [[{ "node": "Auto-approve Variant A" }]] }
+      }
+    },
+
+    "WORKFLOW_3_WHATSAPP_WEBHOOK": {
+      "name": "Tivlen — WhatsApp Reply Webhook",
+      "description": "Always-on webhook. Receives Anisa's WhatsApp reply (1/2/3/0), renders SVG to PNG, posts to Instagram + LinkedIn, schedules Story.",
+      "nodes": [
+        {
+          "id": "w3_webhook",
+          "name": "Twilio WhatsApp Webhook",
+          "type": "n8n-nodes-base.webhook",
+          "parameters": {
+            "path": "tivlen-whatsapp-reply",
+            "httpMethod": "POST",
+            "responseMode": "onReceived",
+            "responseData": "firstEntryJson"
+          },
+          "position": [100, 300],
+          "webhookId": "tivlen-whatsapp-reply",
+          "note": "Set this webhook URL in your Twilio WhatsApp Sandbox 'When a message comes in' field: {{$vars.N8N_WEBHOOK_BASE_URL}}/tivlen-whatsapp-reply"
+        },
+        {
+          "id": "w3_parse_reply",
+          "name": "Parse reply number",
+          "type": "n8n-nodes-base.code",
+          "parameters": {
+            "jsCode": "const body = $input.first().json.body || $input.first().json.Body || '';\nconst from = $input.first().json.from || $input.first().json.From || '';\nconst reply = body.trim();\n\n// Only process replies from Anisa's number\nconst anisaNumber = $vars.ANISA_WHATSAPP_NUMBER.replace('whatsapp:', '');\nif (!from.includes(anisaNumber.replace('+', ''))) {\n  return [{ json: { skip: true, reason: 'message not from Anisa' } }];\n}\n\nconst valid = ['0', '1', '2', '3'];\nif (!valid.includes(reply)) {\n  return [{ json: { skip: true, reason: 'not a valid reply (must be 0-3)' } }];\n}\n\nreturn [{ json: { reply, variantKey: reply === '1' ? 'a' : reply === '2' ? 'b' : reply === '3' ? 'c' : null, skip: reply === '0' } }];"
+          },
+          "position": [300, 300]
+        },
+        {
+          "id": "w3_get_todays_post",
+          "name": "Get today's pending post",
+          "type": "n8n-nodes-base.googleSheets",
+          "parameters": {
+            "operation": "getAll",
+            "spreadsheetId": "={{$vars.GOOGLE_SHEETS_ID}}",
+            "sheetName": "posts",
+            "returnAll": true,
+            "options": {
+              "filters": {
+                "conditions": [
+                  { "column": "scheduled_date", "value": "={{new Date().toISOString().split('T')[0]}}" },
+                  { "column": "status", "value": "pending_approval" }
+                ]
+              }
+            }
+          },
+          "position": [500, 300]
+        },
+        {
+          "id": "w3_should_post",
+          "name": "Skip or post?",
+          "type": "n8n-nodes-base.if",
+          "parameters": {
+            "conditions": {
+              "boolean": [{ "value1": "={{$('Parse reply number').item.json.skip}}", "operation": "equal", "value2": false }]
+            }
+          },
+          "position": [700, 300]
+        },
+        {
+          "id": "w3_extract_variant",
+          "name": "Extract approved variant data",
+          "type": "n8n-nodes-base.code",
+          "parameters": {
+            "jsCode": "const post = $('Get today\\'s pending post').first().json;\nconst v = $('Parse reply number').first().json.variantKey;\n\nconst svgFeed = post['variant_' + v + '_svg_feed'];\nconst svgStory = post['variant_' + v + '_svg_story'];\nconst igCaption = post['variant_' + v + '_ig_caption'];\nconst liCaption = post['variant_' + v + '_li_caption'];\n\nreturn [{ json: {\n  row_id: post.row_id,\n  approved_variant: v,\n  svg_feed: svgFeed,\n  svg_story: svgStory,\n  ig_caption: igCaption,\n  li_caption: liCaption,\n  quote_text: post.quote_text,\n  pillar: post.pillar\n}}];"
+          },
+          "position": [900, 220]
+        },
+        {
+          "id": "w3_wa_confirm",
+          "name": "WhatsApp — confirm approval",
+          "type": "n8n-nodes-base.twilio",
+          "parameters": {
+            "operation": "send",
+            "from": "={{$vars.TWILIO_WHATSAPP_FROM}}",
+            "to": "={{$vars.ANISA_WHATSAPP_NUMBER}}",
+            "message": "={{\"✅ Variant \" + $('Parse reply number').item.json.variantKey.toUpperCase() + \" approved!\\n\\nPosting now:\\n🟡 Instagram feed: 9am\\n🟡 Instagram Story: 11am\\n🟡 LinkedIn: 12pm\\n\\n💛 Go do great things today Anisa!\"}}"
+          },
+          "position": [900, 380]
+        },
+        {
+          "id": "w3_render_feed_png",
+          "name": "Render feed SVG to PNG (CloudConvert)",
+          "type": "n8n-nodes-base.httpRequest",
+          "parameters": {
+            "method": "POST",
+            "url": "https://api.cloudconvert.com/v2/jobs",
+            "sendHeaders": true,
+            "headerParameters": {
+              "parameters": [{ "name": "Authorization", "value": "Bearer ={{$vars.CLOUDCONVERT_API_KEY}}" }]
+            },
+            "sendBody": true,
+            "specifyBody": "json",
+            "jsonBody": "={\n  \"tasks\": {\n    \"upload\": { \"operation\": \"import/raw\", \"file\": \"={{ $json.svg_feed }}\", \"filename\": \"feed.svg\" },\n    \"convert\": { \"operation\": \"convert\", \"input\": \"upload\", \"output_format\": \"png\", \"width\": 1080, \"height\": 1080 },\n    \"export\": { \"operation\": \"export/url\", \"input\": \"convert\" }\n  }\n}"
+          },
+          "position": [1100, 140]
+        },
+        {
+          "id": "w3_render_story_png",
+          "name": "Render story SVG to PNG (CloudConvert)",
+          "type": "n8n-nodes-base.httpRequest",
+          "parameters": {
+            "method": "POST",
+            "url": "https://api.cloudconvert.com/v2/jobs",
+            "sendHeaders": true,
+            "headerParameters": {
+              "parameters": [{ "name": "Authorization", "value": "Bearer ={{$vars.CLOUDCONVERT_API_KEY}}" }]
+            },
+            "sendBody": true,
+            "specifyBody": "json",
+            "jsonBody": "={\n  \"tasks\": {\n    \"upload\": { \"operation\": \"import/raw\", \"file\": \"={{ $('Extract approved variant data').item.json.svg_story }}\", \"filename\": \"story.svg\" },\n    \"convert\": { \"operation\": \"convert\", \"input\": \"upload\", \"output_format\": \"png\", \"width\": 1080, \"height\": 1920 },\n    \"export\": { \"operation\": \"export/url\", \"input\": \"convert\" }\n  }\n}"
+          },
+          "position": [1100, 300]
+        },
+        {
+          "id": "w3_wait_feed",
+          "name": "Wait for feed PNG",
+          "type": "n8n-nodes-base.wait",
+          "parameters": { "amount": 15, "unit": "seconds" },
+          "position": [1300, 140]
+        },
+        {
+          "id": "w3_wait_story",
+          "name": "Wait for story PNG",
+          "type": "n8n-nodes-base.wait",
+          "parameters": { "amount": 15, "unit": "seconds" },
+          "position": [1300, 300]
+        },
+        {
+          "id": "w3_get_feed_url",
+          "name": "Get feed PNG download URL",
+          "type": "n8n-nodes-base.httpRequest",
+          "parameters": {
+            "method": "GET",
+            "url": "=https://api.cloudconvert.com/v2/jobs/{{$('Render feed SVG to PNG (CloudConvert)').item.json.id}}",
+            "sendHeaders": true,
+            "headerParameters": {
+              "parameters": [{ "name": "Authorization", "value": "Bearer ={{$vars.CLOUDCONVERT_API_KEY}}" }]
+            }
+          },
+          "position": [1500, 140]
+        },
+        {
+          "id": "w3_download_feed_png",
+          "name": "Download feed PNG",
+          "type": "n8n-nodes-base.httpRequest",
+          "parameters": {
+            "method": "GET",
+            "url": "={{$json.tasks.find(t => t.name === 'export').result.files[0].url}}",
+            "options": { "response": { "response": { "responseFormat": "file" } } }
+          },
+          "position": [1700, 140]
+        },
+        {
+          "id": "w3_post_instagram_feed",
+          "name": "Post to Instagram feed",
+          "type": "n8n-nodes-base.httpRequest",
+          "parameters": {
+            "method": "POST",
+            "url": "https://graph.facebook.com/v18.0/{{$vars.IG_USER_ID}}/media",
+            "sendHeaders": true,
+            "headerParameters": {
+              "parameters": [{ "name": "Authorization", "value": "Bearer ={{$vars.IG_ACCESS_TOKEN}}" }]
+            },
+            "sendBody": true,
+            "specifyBody": "json",
+            "jsonBody": "={ \"image_url\": \"{{ $('Get feed PNG download URL').item.json.tasks.find(t => t.name === 'export').result.files[0].url }}\", \"caption\": \"={{ $('Extract approved variant data').item.json.ig_caption }}\", \"access_token\": \"={{ $vars.IG_ACCESS_TOKEN }}\" }"
+          },
+          "position": [1900, 140],
+          "note": "Step 1 of 2 for Instagram — creates media container. Must follow with publish step."
+        },
+        {
+          "id": "w3_publish_instagram",
+          "name": "Publish Instagram post",
+          "type": "n8n-nodes-base.httpRequest",
+          "parameters": {
+            "method": "POST",
+            "url": "https://graph.facebook.com/v18.0/={{$vars.IG_USER_ID}}/media_publish",
+            "sendBody": true,
+            "specifyBody": "json",
+            "jsonBody": "={ \"creation_id\": \"={{ $json.id }}\", \"access_token\": \"={{ $vars.IG_ACCESS_TOKEN }}\" }"
+          },
+          "position": [2100, 140]
+        },
+        {
+          "id": "w3_post_linkedin",
+          "name": "Post to LinkedIn",
+          "type": "n8n-nodes-base.linkedIn",
+          "parameters": {
+            "resource": "post",
+            "operation": "create",
+            "text": "={{$('Extract approved variant data').item.json.li_caption}}",
+            "mediaCategory": "IMAGE"
+          },
+          "position": [1900, 300],
+          "note": "Connect LinkedIn OAuth2 credential. Uses same feed PNG."
+        },
+        {
+          "id": "w3_update_sheets_posted",
+          "name": "Update Sheets — mark posted",
+          "type": "n8n-nodes-base.googleSheets",
+          "parameters": {
+            "operation": "update",
+            "spreadsheetId": "={{$vars.GOOGLE_SHEETS_ID}}",
+            "sheetName": "posts",
+            "columns": {
+              "mappingMode": "defineBelow",
+              "value": {
+                "row_id": "={{$('Extract approved variant data').item.json.row_id}}",
+                "status": "posted",
+                "approved_variant": "={{$('Extract approved variant data').item.json.approved_variant}}",
+                "ig_post_id": "={{$('Publish Instagram post').item.json.id}}",
+                "posted_at": "={{new Date().toISOString()}}"
+              }
+            },
+            "options": { "matchKey": "row_id" }
+          },
+          "position": [2300, 220]
+        },
+        {
+          "id": "w3_schedule_story",
+          "name": "Schedule Story post at 11am",
+          "type": "n8n-nodes-base.googleSheets",
+          "parameters": {
+            "operation": "update",
+            "spreadsheetId": "={{$vars.GOOGLE_SHEETS_ID}}",
+            "sheetName": "posts",
+            "columns": {
+              "mappingMode": "defineBelow",
+              "value": {
+                "row_id": "={{$('Extract approved variant data').item.json.row_id}}",
+                "story_status": "pending",
+                "story_post_at": "={{new Date(new Date().setHours(11,0,0,0)).toISOString()}}"
+              }
+            },
+            "options": { "matchKey": "row_id" }
+          },
+          "position": [2300, 360]
+        },
+        {
+          "id": "w3_skip_today",
+          "name": "WhatsApp — confirm skip",
+          "type": "n8n-nodes-base.twilio",
+          "parameters": {
+            "operation": "send",
+            "from": "={{$vars.TWILIO_WHATSAPP_FROM}}",
+            "to": "={{$vars.ANISA_WHATSAPP_NUMBER}}",
+            "message": "👋 Got it — skipping today's post. See you tomorrow at 9am! 💛"
+          },
+          "position": [900, 500]
+        },
+        {
+          "id": "w3_update_sheets_skipped",
+          "name": "Update Sheets — mark skipped",
+          "type": "n8n-nodes-base.googleSheets",
+          "parameters": {
+            "operation": "update",
+            "spreadsheetId": "={{$vars.GOOGLE_SHEETS_ID}}",
+            "sheetName": "posts",
+            "columns": {
+              "mappingMode": "defineBelow",
+              "value": {
+                "row_id": "={{$('Get today\\'s pending post').first().json.row_id}}",
+                "status": "skipped"
+              }
+            },
+            "options": { "matchKey": "row_id" }
+          },
+          "position": [1100, 500]
+        }
+      ],
+      "connections": {
+        "Twilio WhatsApp Webhook": { "main": [[{ "node": "Parse reply number" }]] },
+        "Parse reply number": { "main": [[{ "node": "Get today's pending post" }]] },
+        "Get today's pending post": { "main": [[{ "node": "Skip or post?" }]] },
+        "Skip or post?": {
+          "main": [
+            [{ "node": "Extract approved variant data" }, { "node": "WhatsApp — confirm approval" }],
+            [{ "node": "WhatsApp — confirm skip" }]
+          ]
+        },
+        "Extract approved variant data": { "main": [[{ "node": "Render feed SVG to PNG (CloudConvert)" }, { "node": "Render story SVG to PNG (CloudConvert)" }]] },
+        "Render feed SVG to PNG (CloudConvert)": { "main": [[{ "node": "Wait for feed PNG" }]] },
+        "Wait for feed PNG": { "main": [[{ "node": "Get feed PNG download URL" }]] },
+        "Get feed PNG download URL": { "main": [[{ "node": "Download feed PNG" }]] },
+        "Download feed PNG": { "main": [[{ "node": "Post to Instagram feed" }]] },
+        "Post to Instagram feed": { "main": [[{ "node": "Publish Instagram post" }]] },
+        "Publish Instagram post": { "main": [[{ "node": "Update Sheets — mark posted" }]] },
+        "Render story SVG to PNG (CloudConvert)": { "main": [[{ "node": "Wait for story PNG" }]] },
+        "Post to LinkedIn": { "main": [[{ "node": "Update Sheets — mark posted" }]] },
+        "Update Sheets — mark posted": { "main": [[{ "node": "Schedule Story post at 11am" }]] },
+        "WhatsApp — confirm skip": { "main": [[{ "node": "Update Sheets — mark skipped" }]] }
+      }
+    },
+
+    "WORKFLOW_4_STORY_POSTER": {
+      "name": "Tivlen — Post Instagram Story at 11am",
+      "description": "Runs daily at 11am. Checks Sheets for any pending story. Posts it to Instagram.",
+      "nodes": [
+        {
+          "id": "w4_trigger",
+          "name": "Every day at 11am",
+          "type": "n8n-nodes-base.scheduleTrigger",
+          "parameters": {
+            "rule": { "interval": [{ "field": "cronExpression", "expression": "0 11 * * *" }] }
+          },
+          "position": [100, 300]
+        },
+        {
+          "id": "w4_get_pending_story",
+          "name": "Get pending story",
+          "type": "n8n-nodes-base.googleSheets",
+          "parameters": {
+            "operation": "getAll",
+            "spreadsheetId": "={{$vars.GOOGLE_SHEETS_ID}}",
+            "sheetName": "posts",
+            "returnAll": true,
+            "options": {
+              "filters": {
+                "conditions": [
+                  { "column": "scheduled_date", "value": "={{new Date().toISOString().split('T')[0]}}" },
+                  { "column": "story_status", "value": "pending" }
+                ]
+              }
+            }
+          },
+          "position": [300, 300]
+        },
+        {
+          "id": "w4_post_story",
+          "name": "Post Instagram Story",
+          "type": "n8n-nodes-base.httpRequest",
+          "parameters": {
+            "method": "POST",
+            "url": "https://graph.facebook.com/v18.0/={{$vars.IG_USER_ID}}/media",
+            "sendBody": true,
+            "specifyBody": "json",
+            "jsonBody": "={\n  \"media_type\": \"IMAGE\",\n  \"is_story\": true,\n  \"image_url\": \"={{ $json.story_png_url }}\",\n  \"access_token\": \"={{ $vars.IG_ACCESS_TOKEN }}\"\n}"
+          },
+          "position": [500, 300]
+        },
+        {
+          "id": "w4_mark_story_posted",
+          "name": "Mark story posted",
+          "type": "n8n-nodes-base.googleSheets",
+          "parameters": {
+            "operation": "update",
+            "spreadsheetId": "={{$vars.GOOGLE_SHEETS_ID}}",
+            "sheetName": "posts",
+            "columns": {
+              "mappingMode": "defineBelow",
+              "value": {
+                "row_id": "={{$('Get pending story').first().json.row_id}}",
+                "story_status": "posted",
+                "story_ig_id": "={{$json.id}}"
+              }
+            },
+            "options": { "matchKey": "row_id" }
+          },
+          "position": [700, 300]
+        }
+      ],
+      "connections": {
+        "Every day at 11am": { "main": [[{ "node": "Get pending story" }]] },
+        "Get pending story": { "main": [[{ "node": "Post Instagram Story" }]] },
+        "Post Instagram Story": { "main": [[{ "node": "Mark story posted" }]] }
+      }
+    },
+
+    "WORKFLOW_5_ANALYTICS": {
+      "name": "Tivlen — Engagement Analytics (48h)",
+      "description": "Runs every day at 11am. Checks for posts that were made 48h ago, fetches engagement from Instagram + LinkedIn, logs to Sheets.",
+      "nodes": [
+        {
+          "id": "w5_trigger",
+          "name": "Every day at 11am",
+          "type": "n8n-nodes-base.scheduleTrigger",
+          "parameters": {
+            "rule": { "interval": [{ "field": "cronExpression", "expression": "0 11 * * *" }] }
+          },
+          "position": [100, 300]
+        },
+        {
+          "id": "w5_get_posts_48h",
+          "name": "Get posts from 48h ago",
+          "type": "n8n-nodes-base.code",
+          "parameters": {
+            "jsCode": "// We'll read all sheets rows and filter in code for 48h ago\nreturn [{ json: { target_date: new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString().split('T')[0] } }];"
+          },
+          "position": [300, 300]
+        },
+        {
+          "id": "w5_read_sheets",
+          "name": "Read Sheets for target date",
+          "type": "n8n-nodes-base.googleSheets",
+          "parameters": {
+            "operation": "getAll",
+            "spreadsheetId": "={{$vars.GOOGLE_SHEETS_ID}}",
+            "sheetName": "posts",
+            "returnAll": true,
+            "options": {
+              "filters": {
+                "conditions": [
+                  { "column": "scheduled_date", "value": "={{$json.target_date}}" },
+                  { "column": "status", "value": "posted" }
+                ]
+              }
+            }
+          },
+          "position": [500, 300]
+        },
+        {
+          "id": "w5_fetch_ig_insights",
+          "name": "Fetch Instagram insights",
+          "type": "n8n-nodes-base.httpRequest",
+          "parameters": {
+            "method": "GET",
+            "url": "=https://graph.facebook.com/v18.0/{{$json.ig_post_id}}/insights?metric=likes,comments,saved,reach,impressions&access_token={{$vars.IG_ACCESS_TOKEN}}"
+          },
+          "position": [700, 220]
+        },
+        {
+          "id": "w5_fetch_li_insights",
+          "name": "Fetch LinkedIn insights",
+          "type": "n8n-nodes-base.httpRequest",
+          "parameters": {
+            "method": "GET",
+            "url": "=https://api.linkedin.com/v2/socialActions/{{$('Read Sheets for target date').item.json.li_post_id}}",
+            "sendHeaders": true,
+            "headerParameters": {
+              "parameters": [{ "name": "Authorization", "value": "Bearer ={{$vars.LI_ACCESS_TOKEN}}" }]
+            }
+          },
+          "position": [700, 380]
+        },
+        {
+          "id": "w5_calculate_metrics",
+          "name": "Calculate engagement metrics",
+          "type": "n8n-nodes-base.code",
+          "parameters": {
+            "jsCode": "const igData = $('Fetch Instagram insights').item.json.data || [];\nconst liData = $('Fetch LinkedIn insights').item.json;\n\n// Parse IG metrics\nconst igMetrics = {};\nfor (const m of igData) igMetrics[m.name] = m.values?.[0]?.value || 0;\n\nconst igLikes = igMetrics['likes'] || 0;\nconst igComments = igMetrics['comments'] || 0;\nconst igSaves = igMetrics['saved'] || 0;\nconst igReach = igMetrics['reach'] || 1;\nconst igImpressions = igMetrics['impressions'] || 0;\nconst igEngRate = ((igLikes + igComments + igSaves) / igReach * 100).toFixed(2);\n\n// Parse LI metrics\nconst liReactions = liData?.likesSummary?.totalLikes || 0;\nconst liComments = liData?.commentsSummary?.totalFirstLevelComments || 0;\nconst liImpressions = liData?.totalShareStatistics?.impressionCount || 0;\n\nreturn [{ json: {\n  row_id: $('Read Sheets for target date').item.json.row_id,\n  ig_likes: igLikes,\n  ig_comments: igComments,\n  ig_saves: igSaves,\n  ig_reach: igReach,\n  ig_impressions: igImpressions,\n  ig_eng_rate: parseFloat(igEngRate),\n  li_reactions: liReactions,\n  li_comments: liComments,\n  li_impressions: liImpressions\n}}];"
+          },
+          "position": [900, 300]
+        },
+        {
+          "id": "w5_write_metrics",
+          "name": "Write metrics to Sheets",
+          "type": "n8n-nodes-base.googleSheets",
+          "parameters": {
+            "operation": "update",
+            "spreadsheetId": "={{$vars.GOOGLE_SHEETS_ID}}",
+            "sheetName": "posts",
+            "columns": {
+              "mappingMode": "defineBelow",
+              "value": {
+                "row_id": "={{$json.row_id}}",
+                "ig_likes": "={{$json.ig_likes}}",
+                "ig_comments": "={{$json.ig_comments}}",
+                "ig_saves": "={{$json.ig_saves}}",
+                "ig_reach": "={{$json.ig_reach}}",
+                "ig_eng_rate": "={{$json.ig_eng_rate}}",
+                "li_reactions": "={{$json.li_reactions}}",
+                "li_comments": "={{$json.li_comments}}",
+                "li_impressions": "={{$json.li_impressions}}"
+              }
+            },
+            "options": { "matchKey": "row_id" }
+          },
+          "position": [1100, 300]
+        }
+      ],
+      "connections": {
+        "Every day at 11am": { "main": [[{ "node": "Get posts from 48h ago" }]] },
+        "Get posts from 48h ago": { "main": [[{ "node": "Read Sheets for target date" }]] },
+        "Read Sheets for target date": { "main": [[{ "node": "Fetch Instagram insights" }, { "node": "Fetch LinkedIn insights" }]] },
+        "Fetch Instagram insights": { "main": [[{ "node": "Calculate engagement metrics" }]] },
+        "Fetch LinkedIn insights": { "main": [[{ "node": "Calculate engagement metrics" }]] },
+        "Calculate engagement metrics": { "main": [[{ "node": "Write metrics to Sheets" }]] }
+      }
+    },
+
+    "WORKFLOW_6_MONTHLY_REPORT": {
+      "name": "Tivlen — Monthly Report Email",
+      "description": "Runs on 1st of every month at 9am. Claude reads all posts from previous month, generates a rich HTML performance report, sends via Gmail.",
+      "nodes": [
+        {
+          "id": "w6_trigger",
+          "name": "1st of every month 9am",
+          "type": "n8n-nodes-base.scheduleTrigger",
+          "parameters": {
+            "rule": { "interval": [{ "field": "cronExpression", "expression": "0 9 1 * *" }] }
+          },
+          "position": [100, 300]
+        },
+        {
+          "id": "w6_get_all_posts",
+          "name": "Get last month's posts",
+          "type": "n8n-nodes-base.googleSheets",
+          "parameters": {
+            "operation": "getAll",
+            "spreadsheetId": "={{$vars.GOOGLE_SHEETS_ID}}",
+            "sheetName": "posts",
+            "returnAll": true
+          },
+          "position": [300, 300]
+        },
+        {
+          "id": "w6_filter_last_month",
+          "name": "Filter + summarise last month",
+          "type": "n8n-nodes-base.code",
+          "parameters": {
+            "jsCode": "const now = new Date();\nconst firstOfLastMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1);\nconst firstOfThisMonth = new Date(now.getFullYear(), now.getMonth(), 1);\n\nconst rows = $input.all().map(i => i.json)\n  .filter(r => {\n    const d = new Date(r.scheduled_date);\n    return d >= firstOfLastMonth && d < firstOfThisMonth && r.status === 'posted';\n  });\n\nif (rows.length === 0) return [{ json: { error: 'No posts found for last month' } }];\n\n// Sort by engagement rate\nconst sorted = [...rows].sort((a, b) => (parseFloat(b.ig_eng_rate) || 0) - (parseFloat(a.ig_eng_rate) || 0));\nconst top3 = sorted.slice(0, 3);\n\n// Pillar breakdown\nconst pillarMap = {};\nfor (const r of rows) {\n  pillarMap[r.pillar] = pillarMap[r.pillar] || { count: 0, total_eng: 0 };\n  pillarMap[r.pillar].count++;\n  pillarMap[r.pillar].total_eng += parseFloat(r.ig_eng_rate) || 0;\n}\nconst pillarStats = Object.entries(pillarMap).map(([p, s]) => ({\n  pillar: p, count: s.count, avg_eng: (s.total_eng / s.count).toFixed(2)\n})).sort((a, b) => b.avg_eng - a.avg_eng);\n\n// Format breakdown\nconst formatMap = {};\nfor (const r of rows) {\n  formatMap[r.format] = formatMap[r.format] || { count: 0, total_eng: 0 };\n  formatMap[r.format].count++;\n  formatMap[r.format].total_eng += parseFloat(r.ig_eng_rate) || 0;\n}\nconst formatStats = Object.entries(formatMap).map(([f, s]) => ({\n  format: f, count: s.count, avg_eng: (s.total_eng / s.count).toFixed(2)\n})).sort((a, b) => b.avg_eng - a.avg_eng);\n\nconst avgEngRate = (rows.reduce((s, r) => s + (parseFloat(r.ig_eng_rate) || 0), 0) / rows.length).toFixed(2);\nconst totalPosts = rows.length;\nconst totalReach = rows.reduce((s, r) => s + (parseInt(r.ig_reach) || 0), 0);\nconst totalSaves = rows.reduce((s, r) => s + (parseInt(r.ig_saves) || 0), 0);\n\nconst monthName = firstOfLastMonth.toLocaleDateString('en-GB', { month: 'long', year: 'numeric' });\n\nreturn [{ json: {\n  monthName,\n  totalPosts,\n  avgEngRate,\n  totalReach,\n  totalSaves,\n  top3: JSON.stringify(top3),\n  pillarStats: JSON.stringify(pillarStats),\n  formatStats: JSON.stringify(formatStats),\n  allPostsSummary: JSON.stringify(rows.map(r => ({\n    date: r.scheduled_date,\n    pillar: r.pillar,\n    format: r.format,\n    ig_eng_rate: r.ig_eng_rate,\n    ig_saves: r.ig_saves,\n    ig_reach: r.ig_reach,\n    li_reactions: r.li_reactions,\n    quote: r.quote_text?.substring(0, 80)\n  })))\n}}];"
+          },
+          "position": [500, 300]
+        },
+        {
+          "id": "w6_claude_report",
+          "name": "Claude — generate report HTML",
+          "type": "n8n-nodes-base.httpRequest",
+          "parameters": {
+            "method": "POST",
+            "url": "https://api.anthropic.com/v1/messages",
+            "sendHeaders": true,
+            "headerParameters": {
+              "parameters": [
+                { "name": "x-api-key", "value": "={{$vars.ANTHROPIC_API_KEY}}" },
+                { "name": "anthropic-version", "value": "2023-06-01" },
+                { "name": "content-type", "value": "application/json" }
+              ]
+            },
+            "sendBody": true,
+            "specifyBody": "json",
+            "jsonBody": "={\n  \"model\": \"claude-sonnet-4-20250514\",\n  \"max_tokens\": 4000,\n  \"system\": \"You generate clean, warm monthly performance reports for Tivlen Shop. Write as if you're a thoughtful advisor to Anisa, the founder. The report should be encouraging but honest. Use Tivlen brand colors: primary yellow #F5C518, cream #FFF8E1, dark #1A1A1A. Output ONLY a complete HTML email body (no DOCTYPE, no html/head/body tags). Use inline styles only. Include: header with month + Tivlen branding, 4 summary stat boxes, top 3 posts table, pillar performance breakdown, format performance breakdown, and a personal recommendations section written by Claude in first person to Anisa. End with a warm motivational closing.\",\n  \"messages\": [{\n    \"role\": \"user\",\n    \"content\": \"Generate the monthly report HTML for \" + $json.monthName + \". Data: total posts=\" + $json.totalPosts + \", avg IG engagement rate=\" + $json.avgEngRate + \"%, total reach=\" + $json.totalReach + \", total saves=\" + $json.totalSaves + \". Top 3 posts: \" + $json.top3 + \". Pillar stats: \" + $json.pillarStats + \". Format stats: \" + $json.formatStats + \". All posts: \" + $json.allPostsSummary\n  }]\n}"
+          },
+          "position": [700, 300]
+        },
+        {
+          "id": "w6_send_email",
+          "name": "Send report via Gmail",
+          "type": "n8n-nodes-base.gmail",
+          "parameters": {
+            "operation": "send",
+            "toList": "={{$vars.REPORT_EMAIL}}",
+            "subject": "={{\"💛 Tivlen \" + $('Filter + summarise last month').item.json.monthName + \" — Monthly Performance Report\"}}",
+            "emailType": "html",
+            "message": "={{$json.content[0].text}}"
+          },
+          "position": [900, 300]
+        }
+      ],
+      "connections": {
+        "1st of every month 9am": { "main": [[{ "node": "Get last month's posts" }]] },
+        "Get last month's posts": { "main": [[{ "node": "Filter + summarise last month" }]] },
+        "Filter + summarise last month": { "main": [[{ "node": "Claude — generate report HTML" }]] },
+        "Claude — generate report HTML": { "main": [[{ "node": "Send report via Gmail" }]] }
+      }
+    }
+
+  }
+}
